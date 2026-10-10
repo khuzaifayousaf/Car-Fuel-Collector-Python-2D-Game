@@ -1,0 +1,294 @@
+"""
+2D Car Game in Python (pygame) - the Snake game turned into a car!
+
+You drive a car that collects fuel cans. Every can you collect adds a
+trailer to your convoy. Don't crash into the walls or your own trailers.
+
+Install:  pip install pygame
+Run:      python car_game.py
+
+Controls:
+    Arrow keys / WASD  - steer
+    P                  - pause / resume
+    R or SPACE         - restart after a crash
+    ESC                - quit
+
+No image files needed: the car, trailers and fuel can are drawn in code.
+"""
+
+import random
+import sys
+
+import pygame
+
+# ---------- Settings ----------
+CELL = 32                      # size of one grid cell in pixels
+COLS, ROWS = 26, 18            # grid size
+WIDTH, HEIGHT = COLS * CELL, ROWS * CELL
+HUD_HEIGHT = 44                # score bar at the top
+START_FPS = 7                  # starting speed
+MAX_FPS = 18                   # speed cap
+
+# Colors
+ASPHALT_1 = (52, 54, 60)
+ASPHALT_2 = (58, 60, 67)
+HUD_BG = (16, 16, 20)
+TEXT = (240, 240, 245)
+CRASH_RED = (235, 70, 70)
+BLACK = (18, 18, 18)
+
+CAR_COLOR = (225, 45, 45)
+TRAILER_COLORS = [
+    (60, 130, 220),
+    (240, 190, 50),
+    (70, 190, 110),
+    (170, 90, 210),
+    (240, 130, 50),
+]
+
+UP, DOWN, LEFT, RIGHT = (0, -1), (0, 1), (-1, 0), (1, 0)
+ANGLE = {RIGHT: 0, UP: 90, LEFT: 180, DOWN: 270}  # pygame rotates counter-clockwise
+
+
+# ---------- Drawing the car, trailers and fuel can ----------
+def shade(color, amount):
+    """Make a color lighter (positive) or darker (negative)."""
+    return tuple(max(0, min(255, c + amount)) for c in color)
+
+
+def make_car(color):
+    """Top-down car facing RIGHT."""
+    s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+    # wheels
+    for x in (6, 20):
+        pygame.draw.rect(s, BLACK, (x, 3, 8, 6), border_radius=2)
+        pygame.draw.rect(s, BLACK, (x, CELL - 9, 8, 6), border_radius=2)
+    # body
+    pygame.draw.rect(s, color, (2, 6, CELL - 4, CELL - 12), border_radius=7)
+    # roof
+    pygame.draw.rect(s, shade(color, -35), (10, 9, 11, CELL - 18), border_radius=3)
+    # windshield (front) and rear window
+    pygame.draw.rect(s, (170, 220, 245), (21, 9, 5, CELL - 18), border_radius=2)
+    pygame.draw.rect(s, (120, 170, 200), (6, 10, 4, CELL - 20), border_radius=2)
+    # headlights and tail lights
+    for y in (8, CELL - 12):
+        pygame.draw.rect(s, (255, 240, 140), (CELL - 5, y, 3, 4), border_radius=1)
+        pygame.draw.rect(s, (150, 20, 20), (2, y, 2, 4))
+    return s
+
+
+def make_trailer(color):
+    """Top-down trailer facing RIGHT."""
+    s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+    # wheels
+    for x in (9, 17):
+        pygame.draw.rect(s, BLACK, (x, 5, 7, 5), border_radius=2)
+        pygame.draw.rect(s, BLACK, (x, CELL - 10, 7, 5), border_radius=2)
+    # box body
+    pygame.draw.rect(s, color, (1, 8, CELL - 2, CELL - 16), border_radius=4)
+    # stripe + highlight
+    pygame.draw.rect(s, shade(color, 40), (5, 11, CELL - 10, 3), border_radius=1)
+    pygame.draw.rect(s, shade(color, -40), (1, 8, CELL - 2, CELL - 16), 2, border_radius=4)
+    return s
+
+
+def make_fuel_can():
+    s = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
+    pygame.draw.rect(s, (215, 40, 40), (8, 9, 16, 20), border_radius=3)      # can
+    pygame.draw.rect(s, (215, 40, 40), (17, 4, 6, 7), border_radius=2)       # neck
+    pygame.draw.rect(s, (60, 60, 60), (15, 2, 9, 3), border_radius=1)        # cap
+    pygame.draw.rect(s, (250, 205, 60), (11, 16, 10, 7), border_radius=2)    # label
+    pygame.draw.rect(s, (120, 15, 15), (8, 9, 16, 20), 2, border_radius=3)   # outline
+    return s
+
+
+class Sprites:
+    def __init__(self):
+        car = make_car(CAR_COLOR)
+        self.car = {d: pygame.transform.rotate(car, a) for d, a in ANGLE.items()}
+        self.trailers = []
+        for color in TRAILER_COLORS:
+            t = make_trailer(color)
+            self.trailers.append({
+                "h": t,
+                "v": pygame.transform.rotate(t, 90),
+            })
+        self.fuel = make_fuel_can()
+
+
+# ---------- Game logic ----------
+class Convoy:
+    """The 'snake': a car at the front pulling trailers behind it."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        cx, cy = COLS // 2, ROWS // 2
+        self.body = [(cx, cy), (cx - 1, cy), (cx - 2, cy)]  # car first
+        self.direction = RIGHT
+        self.grow_pending = 0
+
+    def set_direction(self, new_dir):
+        # can't make a U-turn straight into your own trailer
+        if (new_dir[0] + self.direction[0], new_dir[1] + self.direction[1]) != (0, 0):
+            self.direction = new_dir
+
+    def move(self):
+        hx, hy = self.body[0]
+        dx, dy = self.direction
+        self.body.insert(0, (hx + dx, hy + dy))
+        if self.grow_pending > 0:
+            self.grow_pending -= 1
+        else:
+            self.body.pop()
+
+    def grow(self, amount=1):
+        self.grow_pending += amount
+
+    @property
+    def head(self):
+        return self.body[0]
+
+    def hit_wall(self):
+        x, y = self.head
+        return x < 0 or x >= COLS or y < 0 or y >= ROWS
+
+    def hit_self(self):
+        return self.head in self.body[1:]
+
+
+def random_fuel(occupied):
+    free = [(x, y) for x in range(COLS) for y in range(ROWS) if (x, y) not in occupied]
+    return random.choice(free) if free else None
+
+
+def cell_to_px(pos):
+    return pos[0] * CELL, pos[1] * CELL + HUD_HEIGHT
+
+
+def draw_road(surface):
+    for x in range(COLS):
+        for y in range(ROWS):
+            color = ASPHALT_1 if (x + y) % 2 == 0 else ASPHALT_2
+            pygame.draw.rect(surface, color, (x * CELL, y * CELL + HUD_HEIGHT, CELL, CELL))
+    # yellow edge line around the road
+    pygame.draw.rect(surface, (230, 190, 40), (0, HUD_HEIGHT, WIDTH, HEIGHT), 3)
+
+
+def draw_convoy(surface, convoy, sprites):
+    # trailers first (so the car is drawn on top)
+    for i in range(len(convoy.body) - 1, 0, -1):
+        cur = convoy.body[i]
+        ahead = convoy.body[i - 1]
+        vertical = ahead[0] == cur[0]
+        sheet = sprites.trailers[(i - 1) % len(sprites.trailers)]
+        surface.blit(sheet["v" if vertical else "h"], cell_to_px(cur))
+    surface.blit(sprites.car[convoy.direction], cell_to_px(convoy.head))
+
+
+def draw_text_center(surface, font, text, y, color=TEXT):
+    img = font.render(text, True, color)
+    surface.blit(img, img.get_rect(center=(WIDTH // 2, y)))
+
+
+def main():
+    pygame.init()
+    pygame.display.set_caption("Car Game")
+    screen = pygame.display.set_mode((WIDTH, HEIGHT + HUD_HEIGHT))
+    clock = pygame.time.Clock()
+
+    font = pygame.font.SysFont("consolas", 24)
+    big_font = pygame.font.SysFont("consolas", 56, bold=True)
+
+    sprites = Sprites()
+    convoy = Convoy()
+    fuel = random_fuel(convoy.body)
+    score = 0
+    high_score = 0
+    fps = START_FPS
+    crashed = False
+    paused = False
+    dir_queue = []  # buffered turns so quick key presses aren't lost
+
+    key_map = {
+        pygame.K_UP: UP, pygame.K_w: UP,
+        pygame.K_DOWN: DOWN, pygame.K_s: DOWN,
+        pygame.K_LEFT: LEFT, pygame.K_a: LEFT,
+        pygame.K_RIGHT: RIGHT, pygame.K_d: RIGHT,
+    }
+
+    def restart():
+        nonlocal convoy, fuel, score, fps, crashed, paused, dir_queue
+        convoy = Convoy()
+        fuel = random_fuel(convoy.body)
+        score = 0
+        fps = START_FPS
+        crashed = False
+        paused = False
+        dir_queue = []
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    sys.exit()
+                if crashed:
+                    if event.key in (pygame.K_r, pygame.K_SPACE):
+                        restart()
+                    continue
+                if event.key == pygame.K_p:
+                    paused = not paused
+                elif event.key in key_map and len(dir_queue) < 3:
+                    dir_queue.append(key_map[event.key])
+
+        if not crashed and not paused:
+            if dir_queue:
+                convoy.set_direction(dir_queue.pop(0))
+
+            convoy.move()
+
+            if convoy.hit_wall() or convoy.hit_self():
+                crashed = True
+                high_score = max(high_score, score)
+            elif fuel and convoy.head == fuel:
+                convoy.grow()
+                score += 10
+                fps = min(MAX_FPS, START_FPS + score // 50)
+                fuel = random_fuel(convoy.body)
+                if fuel is None:  # road is completely full - you win
+                    crashed = True
+                    high_score = max(high_score, score)
+
+        # ---------- Drawing ----------
+        screen.fill(HUD_BG)
+        draw_road(screen)
+
+        if fuel:
+            screen.blit(sprites.fuel, cell_to_px(fuel))
+
+        draw_convoy(screen, convoy, sprites)
+
+        # HUD
+        pygame.draw.rect(screen, HUD_BG, (0, 0, WIDTH, HUD_HEIGHT))
+        screen.blit(font.render(f"Fuel collected: {score // 10}   Score: {score}", True, TEXT), (12, 10))
+        best = font.render(f"Best: {high_score}", True, TEXT)
+        screen.blit(best, (WIDTH - best.get_width() - 12, 10))
+
+        if paused:
+            draw_text_center(screen, big_font, "PAUSED", HUD_HEIGHT + HEIGHT // 2)
+        if crashed:
+            draw_text_center(screen, big_font, "CRASH!", HUD_HEIGHT + HEIGHT // 2 - 30, CRASH_RED)
+            draw_text_center(screen, font, "Press R or SPACE to drive again",
+                             HUD_HEIGHT + HEIGHT // 2 + 25)
+
+        pygame.display.flip()
+        clock.tick(fps)
+
+
+if __name__ == "__main__":
+    main()
